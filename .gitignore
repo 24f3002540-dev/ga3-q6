@@ -1,0 +1,8 @@
+﻿.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+test.py
+sample.wav
+sample.mp3
