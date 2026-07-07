@@ -114,6 +114,7 @@ def clean_numeric_dict(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
         if k in columns and is_number(v):
@@ -197,31 +198,13 @@ def normalize_response(obj):
 
 def make_prompt(audio_id: str):
     return f"""
-You are a strict audio-to-JSON statistics API.
+Return ONLY valid JSON. No markdown. No explanation.
 
-The audio may be English, Hindi, or Japanese.
+Listen to the audio and extract the described dataset/table/statistics.
 
-Listen carefully and extract the dataset/table described in the audio.
+The audio may be in English, Hindi, or Japanese.
 
-Return ONLY valid JSON.
-No markdown.
-No explanation.
-
-Important:
-- Column names must be exactly as spoken.
-- Do NOT translate Japanese column names.
-- If the column name is 会社, return exactly "会社".
-- If audio says one column named 会社, columns must be ["会社"].
-- Do not omit columns.
-- rows must be an integer.
-- Use JSON numbers for numeric values.
-- For categorical/string columns, do NOT fill mean, std, variance, min, max, median, mode, or range.
-- For categorical/string columns, put categories only in allowed_values.
-- For numeric columns, compute mean, std, variance, min, max, median, mode, and range.
-- If not applicable, use empty object {{}} or empty array [].
-- Return all required keys exactly.
-
-Return exactly this JSON structure:
+Required JSON structure:
 
 {{
   "rows": 0,
@@ -239,14 +222,26 @@ Return exactly this JSON structure:
   "correlation": []
 }}
 
+Rules:
+- Return all keys exactly.
+- Column names must be exact. Do not translate Japanese.
+- If the column is 会社, columns must be ["会社"].
+- rows must be integer.
+- For categorical/string columns, do NOT fill mean/std/variance/min/max/median/mode/range.
+- For categorical/string columns, put categories only in allowed_values.
+- For numeric columns, compute mean/std/variance/min/max/median/mode/range.
+- Use JSON numbers, not strings.
+- If not applicable, use empty object {{}} or empty array [].
+
 audio_id: {audio_id}
 """
 
 
-def call_gemini_once(audio_bytes: bytes, mime_type: str, audio_id: str):
+def analyze_with_gemini(audio_bytes: bytes, mime_type: str, audio_id: str):
     api_key = get_api_key()
+
     if not api_key:
-        return None
+        return empty_response()
 
     genai.configure(api_key=api_key)
 
@@ -265,46 +260,18 @@ def call_gemini_once(audio_bytes: bytes, mime_type: str, audio_id: str):
             "top_p": 1,
             "top_k": 1,
         },
+        request_options={
+            "timeout": 9
+        }
     )
 
     raw = response.text if response and response.text else "{}"
     obj = extract_json(raw)
 
     if obj is None:
-        return None
+        return empty_response()
 
     return normalize_response(obj)
-
-
-def analyze_with_gemini(audio_bytes: bytes, detected_mime: str, audio_id: str):
-    mime_candidates = []
-
-    if detected_mime:
-        mime_candidates.append(detected_mime)
-
-    for m in ["audio/wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/webm", "audio/ogg", "audio/flac"]:
-        if m not in mime_candidates:
-            mime_candidates.append(m)
-
-    best = empty_response()
-
-    for mime_type in mime_candidates:
-        try:
-            result = call_gemini_once(audio_bytes, mime_type, audio_id)
-
-            if not result:
-                continue
-
-            # Best result is one with columns detected
-            if result.get("columns"):
-                return result
-
-            best = result
-
-        except Exception:
-            continue
-
-    return best
 
 
 @app.get("/")
@@ -329,7 +296,6 @@ def analyze_audio(req: AudioRequest):
     try:
         audio_bytes, mime_type = decode_audio_and_mime(req.audio_base64)
         return analyze_with_gemini(audio_bytes, mime_type, req.audio_id)
-
     except Exception:
         return empty_response()
 
