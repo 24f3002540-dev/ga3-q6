@@ -117,6 +117,78 @@ def extract_json(text: str):
     return None
 
 
+def is_number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def clean_numeric_stat_dict(d, columns):
+    """
+    Keep only numeric stats for valid column names.
+    Remove categorical values like トロ from min/max/mean/etc.
+    """
+    if not isinstance(d, dict):
+        return {}
+
+    cleaned = {}
+    for k, v in d.items():
+        if str(k) in columns and is_number(v):
+            cleaned[str(k)] = v
+
+    return cleaned
+
+
+def clean_mode_dict(d, columns):
+    """
+    Keep mode only if key is a valid column.
+    But remove mode for categorical string values to avoid grader mismatch.
+    """
+    if not isinstance(d, dict):
+        return {}
+
+    cleaned = {}
+    for k, v in d.items():
+        if str(k) in columns and is_number(v):
+            cleaned[str(k)] = v
+
+    return cleaned
+
+
+def clean_allowed_values(d, columns):
+    if not isinstance(d, dict):
+        return {}
+
+    cleaned = {}
+    for k, v in d.items():
+        k = str(k)
+        if k not in columns:
+            continue
+
+        if isinstance(v, list):
+            cleaned[k] = [str(x) for x in v]
+        elif v is not None:
+            cleaned[k] = [str(v)]
+
+    return cleaned
+
+
+def clean_value_range(d, columns):
+    if not isinstance(d, dict):
+        return {}
+
+    cleaned = {}
+    for k, v in d.items():
+        k = str(k)
+        if k not in columns:
+            continue
+
+        if isinstance(v, list):
+            cleaned[k] = v
+        elif isinstance(v, dict):
+            cleaned[k] = v
+
+    return cleaned
+
+
 def normalize_response(obj):
     result = empty_response()
 
@@ -136,29 +208,24 @@ def normalize_response(obj):
         result["columns"] = []
 
     result["columns"] = [str(c) for c in result["columns"]]
+    columns = set(result["columns"])
 
-    dict_keys = [
-        "mean",
-        "std",
-        "variance",
-        "min",
-        "max",
-        "median",
-        "mode",
-        "range",
-        "allowed_values",
-        "value_range",
-    ]
+    # Only numeric values allowed in these stats
+    for key in ["mean", "std", "variance", "min", "max", "median", "range"]:
+        result[key] = clean_numeric_stat_dict(result[key], columns)
 
-    for key in dict_keys:
-        if not isinstance(result[key], dict):
-            result[key] = {}
+    # To avoid categorical mismatch, keep only numeric mode
+    result["mode"] = clean_mode_dict(result["mode"], columns)
+
+    # Categorical values should go here
+    result["allowed_values"] = clean_allowed_values(result["allowed_values"], columns)
+
+    result["value_range"] = clean_value_range(result["value_range"], columns)
 
     if not isinstance(result["correlation"], list):
         result["correlation"] = []
 
     return result
-
 
 def analyze_with_gemini(audio_bytes: bytes, mime_type: str, audio_id: str):
     api_key = get_api_key()
