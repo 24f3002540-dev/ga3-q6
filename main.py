@@ -6,9 +6,7 @@ import copy
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -82,7 +80,6 @@ def decode_audio_and_mime(audio_base64: str):
     if b"ftyp" in audio_bytes[:40]:
         return audio_bytes, "audio/mp4"
 
-    # Most graders use wav/mp3, but unknown default should still be audio
     return audio_bytes, "audio/wav"
 
 
@@ -186,11 +183,8 @@ def normalize_response(obj):
     result["columns"] = [str(c) for c in result["columns"]]
     columns = set(result["columns"])
 
-    for key in ["mean", "std", "variance", "min", "max", "median", "range"]:
+    for key in ["mean", "std", "variance", "min", "max", "median", "mode", "range"]:
         result[key] = clean_numeric_dict(result[key], columns)
-
-    # Keep mode only for numeric columns to avoid categorical mismatch
-    result["mode"] = clean_numeric_dict(result["mode"], columns)
 
     result["allowed_values"] = clean_allowed_values(result["allowed_values"], columns)
     result["value_range"] = clean_value_range(result["value_range"], columns)
@@ -201,18 +195,11 @@ def normalize_response(obj):
     return result
 
 
-def analyze_with_gemini(audio_bytes: bytes, mime_type: str, audio_id: str):
-    api_key = get_api_key()
-
-    if not api_key:
-        return empty_response()
-
-    client = genai.Client(api_key=api_key)
-
-    prompt = f"""
+def make_prompt(audio_id: str):
+    return f"""
 You are a strict audio-to-JSON statistics API.
 
-The audio may be in English, Hindi, or Japanese.
+The audio may be English, Hindi, or Japanese.
 
 Listen carefully and extract the dataset/table described in the audio.
 
@@ -220,21 +207,21 @@ Return ONLY valid JSON.
 No markdown.
 No explanation.
 
-Important rules:
+Important:
 - Column names must be exactly as spoken.
-- Do not translate Japanese column names.
+- Do NOT translate Japanese column names.
 - If the column name is 会社, return exactly "会社".
-- If the audio says one column named 会社, columns must be ["会社"].
+- If audio says one column named 会社, columns must be ["会社"].
 - Do not omit columns.
 - rows must be an integer.
 - Use JSON numbers for numeric values.
 - For categorical/string columns, do NOT fill mean, std, variance, min, max, median, mode, or range.
 - For categorical/string columns, put categories only in allowed_values.
 - For numeric columns, compute mean, std, variance, min, max, median, mode, and range.
-- If something is not applicable, use empty object {{}} or empty array [].
+- If not applicable, use empty object {{}} or empty array [].
 - Return all required keys exactly.
 
-Return exactly this structure:
+Return exactly this JSON structure:
 
 {{
   "rows": 0,
@@ -255,26 +242,69 @@ Return exactly this structure:
 audio_id: {audio_id}
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            types.Part.from_text(text=prompt),
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+
+def call_gemini_once(audio_bytes: bytes, mime_type: str, audio_id: str):
+    api_key = get_api_key()
+    if not api_key:
+        return None
+
+    genai.configure(api_key=api_key)
+
+    model = genai.GenerativeModel(GEMINI_MODEL)
+
+    response = model.generate_content(
+        [
+            make_prompt(audio_id),
+            {
+                "mime_type": mime_type,
+                "data": audio_bytes,
+            },
         ],
-        config=types.GenerateContentConfig(
-            temperature=0,
-            top_p=1,
-            top_k=1,
-        ),
+        generation_config={
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 1,
+        },
     )
 
-    raw = response.text or "{}"
+    raw = response.text if response and response.text else "{}"
     obj = extract_json(raw)
 
     if obj is None:
-        return empty_response()
+        return None
 
     return normalize_response(obj)
+
+
+def analyze_with_gemini(audio_bytes: bytes, detected_mime: str, audio_id: str):
+    mime_candidates = []
+
+    if detected_mime:
+        mime_candidates.append(detected_mime)
+
+    for m in ["audio/wav", "audio/mpeg", "audio/mp3", "audio/mp4", "audio/webm", "audio/ogg", "audio/flac"]:
+        if m not in mime_candidates:
+            mime_candidates.append(m)
+
+    best = empty_response()
+
+    for mime_type in mime_candidates:
+        try:
+            result = call_gemini_once(audio_bytes, mime_type, audio_id)
+
+            if not result:
+                continue
+
+            # Best result is one with columns detected
+            if result.get("columns"):
+                return result
+
+            best = result
+
+        except Exception:
+            continue
+
+    return best
 
 
 @app.get("/")
@@ -299,6 +329,7 @@ def analyze_audio(req: AudioRequest):
     try:
         audio_bytes, mime_type = decode_audio_and_mime(req.audio_base64)
         return analyze_with_gemini(audio_bytes, mime_type, req.audio_id)
+
     except Exception:
         return empty_response()
 
