@@ -3,13 +3,12 @@ import re
 import json
 import base64
 import copy
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
 
 
-# Use 2.0 Flash for speed. 2.5 Flash may be slower for audio under 12s grader timeout.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 app = FastAPI()
@@ -44,6 +43,13 @@ EMPTY_RESPONSE = {
     "correlation": []
 }
 
+LAST_DEBUG = {
+    "error": None,
+    "mime_type": None,
+    "model": GEMINI_MODEL,
+    "raw_text": None,
+}
+
 
 def empty_response():
     return copy.deepcopy(EMPTY_RESPONSE)
@@ -53,48 +59,44 @@ def get_api_key():
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
-def decode_audio_and_mime(audio_base64: str):
+def decode_base64_and_mime(audio_base64: str):
     mime_type = None
 
-    # Handle data URL:
-    # data:audio/webm;base64,...
-    # data:audio/wav;base64,...
     if audio_base64.startswith("data:") and "," in audio_base64:
         header, audio_base64 = audio_base64.split(",", 1)
-        if ":" in header and ";" in header:
-            mime_type = header.split(":", 1)[1].split(";", 1)[0].strip()
 
-    audio_bytes = base64.b64decode(audio_base64)
+        if ":" in header and ";" in header:
+            mime_type = header.split(":", 1)[1].split(";", 1)[0].strip().lower()
+
+    clean_b64 = audio_base64.strip()
+    audio_bytes = base64.b64decode(clean_b64)
 
     if mime_type:
-        return audio_bytes, mime_type
+        if mime_type in ["audio/mp3", "audio/x-mp3"]:
+            mime_type = "audio/mpeg"
+        if mime_type in ["audio/x-wav", "audio/wave"]:
+            mime_type = "audio/wav"
+        return clean_b64, audio_bytes, mime_type
 
-    # WAV
     if audio_bytes.startswith(b"RIFF"):
-        return audio_bytes, "audio/wav"
+        return clean_b64, audio_bytes, "audio/wav"
 
-    # MP3
     if audio_bytes.startswith(b"ID3") or audio_bytes[:2] == b"\xff\xfb":
-        return audio_bytes, "audio/mpeg"
+        return clean_b64, audio_bytes, "audio/mpeg"
 
-    # OGG
     if audio_bytes.startswith(b"OggS"):
-        return audio_bytes, "audio/ogg"
+        return clean_b64, audio_bytes, "audio/ogg"
 
-    # FLAC
     if audio_bytes.startswith(b"fLaC"):
-        return audio_bytes, "audio/flac"
+        return clean_b64, audio_bytes, "audio/flac"
 
-    # MP4 / M4A
-    if b"ftyp" in audio_bytes[:64]:
-        return audio_bytes, "audio/mp4"
+    if b"ftyp" in audio_bytes[:80]:
+        return clean_b64, audio_bytes, "audio/mp4"
 
-    # WEBM / Matroska EBML header
     if audio_bytes.startswith(b"\x1A\x45\xDF\xA3"):
-        return audio_bytes, "audio/webm"
+        return clean_b64, audio_bytes, "audio/webm"
 
-    # Browser audio is commonly webm, so default to webm, not wav
-    return audio_bytes, "audio/webm"
+    return clean_b64, audio_bytes, "audio/webm"
 
 
 def extract_json(text: str):
@@ -128,6 +130,7 @@ def clean_numeric_dict(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
         if k in columns and is_number(v):
@@ -141,6 +144,7 @@ def clean_allowed_values(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
 
@@ -160,6 +164,7 @@ def clean_value_range(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
 
@@ -174,7 +179,7 @@ def clean_value_range(d, columns):
     return cleaned
 
 
-def infer_columns_from_result(result):
+def infer_columns(result):
     columns = result.get("columns", [])
 
     if not isinstance(columns, list):
@@ -182,8 +187,7 @@ def infer_columns_from_result(result):
 
     columns = [str(c) for c in columns if str(c).strip()]
 
-    # If Gemini forgot columns but produced stats keys, recover them
-    possible_dict_keys = [
+    for key in [
         "mean",
         "std",
         "variance",
@@ -194,9 +198,7 @@ def infer_columns_from_result(result):
         "range",
         "allowed_values",
         "value_range",
-    ]
-
-    for key in possible_dict_keys:
+    ]:
         d = result.get(key)
         if isinstance(d, dict):
             for col in d.keys():
@@ -222,10 +224,9 @@ def normalize_response(obj):
     except Exception:
         result["rows"] = 0
 
-    result["columns"] = infer_columns_from_result(result)
+    result["columns"] = infer_columns(result)
     columns = set(result["columns"])
 
-    # Numeric stats only. Remove categorical values from max/min/mode etc.
     for key in ["mean", "std", "variance", "min", "max", "median", "mode", "range"]:
         result[key] = clean_numeric_dict(result[key], columns)
 
@@ -240,17 +241,13 @@ def normalize_response(obj):
 
 def make_prompt(audio_id: str):
     return f"""
-You are a strict audio-to-JSON statistics API.
+You are an audio-to-JSON statistics extraction API.
 
-Listen to the audio and extract the dataset/table/statistics.
+Listen carefully to the audio. The audio may be in English, Hindi, Japanese, Korean, or mixed language.
 
-The audio may be in English, Hindi, Japanese, Korean, or mixed language.
+Return ONLY valid JSON. No markdown. No explanation.
 
-Return ONLY valid JSON.
-No markdown.
-No explanation.
-
-Required output structure exactly:
+Return exactly this JSON structure:
 
 {{
   "rows": 0,
@@ -271,61 +268,96 @@ Required output structure exactly:
 Rules:
 - Return all keys exactly.
 - Do not translate column names.
-- Keep Korean column names exactly, e.g. 소득.
-- Keep Japanese column names exactly, e.g. 会社.
-- If audio says one column named 소득, columns must be ["소득"].
-- If audio says one column named 会社, columns must be ["会社"].
+- Keep Korean column names exactly, for example 소득.
+- Keep Japanese column names exactly, for example 会社.
+- If the audio says the column is 소득, columns must be ["소득"].
+- If the audio says the column is 会社, columns must be ["会社"].
 - rows must be an integer.
-- Use JSON numbers, not strings.
-- For categorical/string columns, do NOT fill mean, std, variance, min, max, median, mode, or range.
-- For categorical/string columns, put categories only in allowed_values.
+- columns must list every column found in the audio.
+- Numeric values must be JSON numbers, not strings.
 - For numeric columns, compute mean, std, variance, min, max, median, mode, and range.
+- For categorical/string columns, do not fill mean/std/variance/min/max/median/mode/range.
+- For categorical/string columns, put categories only in allowed_values.
 - If a field is not applicable, use {{}} or [].
 
 audio_id: {audio_id}
 """
 
 
-def analyze_with_gemini(audio_bytes: bytes, mime_type: str, audio_id: str):
+def call_gemini_rest(audio_base64: str, mime_type: str, audio_id: str):
     api_key = get_api_key()
 
     if not api_key:
+        LAST_DEBUG["error"] = "Missing API key"
         return empty_response()
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-
-    response = model.generate_content(
-        [
-            make_prompt(audio_id),
-            {
-                "mime_type": mime_type,
-                "data": audio_bytes,
-            },
-        ],
-        generation_config={
-            "temperature": 0,
-            "top_p": 1,
-            "top_k": 1,
-            "response_mime_type": "application/json",
-        },
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={api_key}"
     )
 
-    raw = response.text if response and response.text else "{}"
-    obj = extract_json(raw)
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": make_prompt(audio_id)},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": audio_base64,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "topP": 1,
+            "topK": 1,
+            "responseMimeType": "application/json",
+        },
+    }
 
-    if obj is None:
+    LAST_DEBUG["mime_type"] = mime_type
+    LAST_DEBUG["model"] = GEMINI_MODEL
+    LAST_DEBUG["error"] = None
+    LAST_DEBUG["raw_text"] = None
+
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code != 200:
+            LAST_DEBUG["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
+            return empty_response()
+
+        data = response.json()
+
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "{}")
+        )
+
+        LAST_DEBUG["raw_text"] = text[:1000]
+
+        obj = extract_json(text)
+
+        if obj is None:
+            LAST_DEBUG["error"] = "Could not parse JSON"
+            return empty_response()
+
+        return normalize_response(obj)
+
+    except Exception as e:
+        LAST_DEBUG["error"] = str(e)
         return empty_response()
-
-    return normalize_response(obj)
 
 
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "message": "Audio statistics API is running"
-    }
+    return {"status": "ok", "message": "Audio statistics API is running"}
 
 
 @app.get("/debug-key")
@@ -337,12 +369,19 @@ def debug_key():
     }
 
 
+@app.get("/debug-last")
+def debug_last():
+    return LAST_DEBUG
+
+
 @app.post("/analyze-audio")
 def analyze_audio(req: AudioRequest):
     try:
-        audio_bytes, mime_type = decode_audio_and_mime(req.audio_base64)
-        return analyze_with_gemini(audio_bytes, mime_type, req.audio_id)
-    except Exception:
+        clean_b64, _audio_bytes, mime_type = decode_base64_and_mime(req.audio_base64)
+        return call_gemini_rest(clean_b64, mime_type, req.audio_id)
+
+    except Exception as e:
+        LAST_DEBUG["error"] = str(e)
         return empty_response()
 
 
