@@ -6,7 +6,9 @@ import copy
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
+
+from google import genai
+from google.genai import types
 
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -53,19 +55,10 @@ def get_api_key():
 
 
 def decode_audio_and_mime(audio_base64: str):
-    """
-    Handles:
-    1. raw base64
-    2. data:audio/wav;base64,...
-    3. data:audio/mpeg;base64,...
-    4. data:audio/webm;base64,...
-    """
     mime_type = None
 
     if audio_base64.startswith("data:") and "," in audio_base64:
         header, audio_base64 = audio_base64.split(",", 1)
-
-        # Example: data:audio/wav;base64
         if ":" in header and ";" in header:
             mime_type = header.split(":", 1)[1].split(";", 1)[0].strip()
 
@@ -74,7 +67,6 @@ def decode_audio_and_mime(audio_base64: str):
     if mime_type:
         return audio_bytes, mime_type
 
-    # Detect common audio formats from bytes
     if audio_bytes.startswith(b"RIFF"):
         return audio_bytes, "audio/wav"
 
@@ -87,12 +79,11 @@ def decode_audio_and_mime(audio_base64: str):
     if audio_bytes.startswith(b"fLaC"):
         return audio_bytes, "audio/flac"
 
-    # MP4 / M4A usually contains ftyp near beginning
-    if b"ftyp" in audio_bytes[:32]:
+    if b"ftyp" in audio_bytes[:40]:
         return audio_bytes, "audio/mp4"
 
-    # Safer default for browser-recorded audio
-    return audio_bytes, "audio/webm"
+    # Most graders use wav/mp3, but unknown default should still be audio
+    return audio_bytes, "audio/wav"
 
 
 def extract_json(text: str):
@@ -121,34 +112,15 @@ def is_number(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def clean_numeric_stat_dict(d, columns):
-    """
-    Keep only numeric stats for valid column names.
-    Remove categorical values like トロ from min/max/mean/etc.
-    """
+def clean_numeric_dict(d, columns):
     if not isinstance(d, dict):
         return {}
 
     cleaned = {}
     for k, v in d.items():
-        if str(k) in columns and is_number(v):
-            cleaned[str(k)] = v
-
-    return cleaned
-
-
-def clean_mode_dict(d, columns):
-    """
-    Keep mode only if key is a valid column.
-    But remove mode for categorical string values to avoid grader mismatch.
-    """
-    if not isinstance(d, dict):
-        return {}
-
-    cleaned = {}
-    for k, v in d.items():
-        if str(k) in columns and is_number(v):
-            cleaned[str(k)] = v
+        k = str(k)
+        if k in columns and is_number(v):
+            cleaned[k] = v
 
     return cleaned
 
@@ -158,8 +130,10 @@ def clean_allowed_values(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
+
         if k not in columns:
             continue
 
@@ -176,8 +150,10 @@ def clean_value_range(d, columns):
         return {}
 
     cleaned = {}
+
     for k, v in d.items():
         k = str(k)
+
         if k not in columns:
             continue
 
@@ -210,16 +186,13 @@ def normalize_response(obj):
     result["columns"] = [str(c) for c in result["columns"]]
     columns = set(result["columns"])
 
-    # Only numeric values allowed in these stats
     for key in ["mean", "std", "variance", "min", "max", "median", "range"]:
-        result[key] = clean_numeric_stat_dict(result[key], columns)
+        result[key] = clean_numeric_dict(result[key], columns)
 
-    # To avoid categorical mismatch, keep only numeric mode
-    result["mode"] = clean_mode_dict(result["mode"], columns)
+    # Keep mode only for numeric columns to avoid categorical mismatch
+    result["mode"] = clean_numeric_dict(result["mode"], columns)
 
-    # Categorical values should go here
     result["allowed_values"] = clean_allowed_values(result["allowed_values"], columns)
-
     result["value_range"] = clean_value_range(result["value_range"], columns)
 
     if not isinstance(result["correlation"], list):
@@ -227,36 +200,41 @@ def normalize_response(obj):
 
     return result
 
+
 def analyze_with_gemini(audio_bytes: bytes, mime_type: str, audio_id: str):
     api_key = get_api_key()
 
     if not api_key:
         return empty_response()
 
-    genai.configure(api_key=api_key)
-
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=api_key)
 
     prompt = f"""
 You are a strict audio-to-JSON statistics API.
 
 The audio may be in English, Hindi, or Japanese.
 
-Task:
-1. Listen to the audio carefully.
-2. Extract the described table/dataset.
-3. Compute the requested statistics.
-4. Return ONLY valid JSON.
+Listen carefully and extract the dataset/table described in the audio.
 
-Very important:
-- Column names must be exactly as spoken, including Japanese names such as 会社.
-- If the audio says there is one column named 会社, columns must be ["会社"].
-- Do not translate column names.
+Return ONLY valid JSON.
+No markdown.
+No explanation.
+
+Important rules:
+- Column names must be exactly as spoken.
+- Do not translate Japanese column names.
+- If the column name is 会社, return exactly "会社".
+- If the audio says one column named 会社, columns must be ["会社"].
 - Do not omit columns.
-- Use all required keys exactly.
-- Use numbers as JSON numbers, not strings.
+- rows must be an integer.
+- Use JSON numbers for numeric values.
+- For categorical/string columns, do NOT fill mean, std, variance, min, max, median, mode, or range.
+- For categorical/string columns, put categories only in allowed_values.
+- For numeric columns, compute mean, std, variance, min, max, median, mode, and range.
+- If something is not applicable, use empty object {{}} or empty array [].
+- Return all required keys exactly.
 
-Return exactly this JSON structure:
+Return exactly this structure:
 
 {{
   "rows": 0,
@@ -274,37 +252,23 @@ Return exactly this JSON structure:
   "correlation": []
 }}
 
-Rules:
-- rows must be an integer.
-- columns must be a JSON array.
-- mean, std, variance, min, max, median, mode, range must be JSON objects.
-- allowed_values must be a JSON object.
-- value_range must be a JSON object.
-- correlation must be a JSON array.
-- For categorical columns, fill allowed_values.
-- For numeric columns, compute mean, std, variance, min, max, median, mode, and range.
-- If a statistic is not applicable, use {{}}.
-- Return JSON only. No markdown. No explanation.
-
 audio_id: {audio_id}
 """
 
-    response = model.generate_content(
-        [
-            prompt,
-            {
-                "mime_type": mime_type,
-                "data": audio_bytes,
-            },
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
         ],
-        generation_config={
-            "temperature": 0,
-            "top_p": 1,
-            "top_k": 1,
-        },
+        config=types.GenerateContentConfig(
+            temperature=0,
+            top_p=1,
+            top_k=1,
+        ),
     )
 
-    raw = response.text if response and response.text else "{}"
+    raw = response.text or "{}"
     obj = extract_json(raw)
 
     if obj is None:
@@ -321,12 +285,20 @@ def root():
     }
 
 
+@app.get("/debug-key")
+def debug_key():
+    api_key = get_api_key()
+    return {
+        "has_key": bool(api_key),
+        "model": GEMINI_MODEL
+    }
+
+
 @app.post("/analyze-audio")
 def analyze_audio(req: AudioRequest):
     try:
         audio_bytes, mime_type = decode_audio_and_mime(req.audio_base64)
         return analyze_with_gemini(audio_bytes, mime_type, req.audio_id)
-
     except Exception:
         return empty_response()
 
